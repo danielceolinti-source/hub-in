@@ -1,0 +1,1 @@
+This file should be tracked by git. If this shows in git status, the issue is with gitignore for the new directories.
