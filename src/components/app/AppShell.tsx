@@ -1,4 +1,5 @@
 import { Link, useLocation } from "@tanstack/react-router";
+import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import {
   LayoutDashboard, MessageSquare, Hash, Users, Settings, Search,
@@ -7,6 +8,7 @@ import {
 import { Logo } from "@/components/brand/Logo";
 import { useAuth } from "@/lib/auth";
 import { useTheme } from "@/lib/theme";
+import { NotificationsService } from "@/lib/services/notifications";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -18,8 +20,8 @@ import {
 
 const items = [
   { to: "/app", label: "Dashboard", icon: LayoutDashboard, exact: true },
-  { to: "/app/inbox", label: "Atendimentos", icon: MessageSquare, badge: 12 },
-  { to: "/app/internal", label: "Chat interno", icon: Hash, badge: 3 },
+  { to: "/app/inbox", label: "Atendimentos", icon: MessageSquare },
+  { to: "/app/internal", label: "Chat interno", icon: Hash },
   { to: "/app/contacts", label: "Contatos", icon: Users },
   { to: "/app/reports", label: "Relatórios", icon: BarChart3 },
   { to: "/app/settings", label: "Configurações", icon: Settings },
@@ -29,18 +31,28 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const { profile, company, signOut } = useAuth();
   const { theme, toggle } = useTheme();
   const loc = useLocation();
+  const [notifCount, setNotifCount] = useState(0);
+  const [unreadConversations, setUnreadConversations] = useState(0);
 
   const initials = (profile?.full_name || "U").split(" ").map(s => s[0]).slice(0, 2).join("").toUpperCase();
 
+  // Load notification count
+  useEffect(() => {
+    if (!profile?.id) return;
+    NotificationsService.getUnreadCount(profile.id).then(setNotifCount).catch(() => {});
+    const sub = NotificationsService.subscribeToNotifications(profile.id, () => {
+      setNotifCount(prev => prev + 1);
+    });
+    return () => { try { sub.unsubscribe(); } catch {} };
+  }, [profile?.id]);
+
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-background">
-      {/* Sidebar */}
       <aside className="hidden w-[260px] shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground md:flex">
         <div className="flex h-16 items-center gap-2 border-b border-sidebar-border px-5">
           <Logo />
         </div>
 
-        {/* Company switcher */}
         <div className="px-3 pt-3">
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -64,7 +76,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </DropdownMenu>
         </div>
 
-        {/* Nav */}
         <nav className="mt-2 flex-1 space-y-0.5 overflow-y-auto px-3 py-2">
           <p className="px-2 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-sidebar-foreground/50">
             Operação
@@ -84,17 +95,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 )}
                 <it.icon className="h-[18px] w-[18px]" />
                 <span className="flex-1">{it.label}</span>
-                {it.badge && (
-                  <Badge variant="secondary" className="h-5 bg-[color:var(--sidebar-primary)]/15 text-[color:var(--sidebar-primary)]">
-                    {it.badge}
-                  </Badge>
-                )}
               </Link>
             );
           })}
         </nav>
 
-        {/* Footer card */}
         <div className="border-t border-sidebar-border p-3">
           <div className="flex items-center gap-3 rounded-lg bg-sidebar-accent/40 p-2.5">
             <div className="relative">
@@ -115,7 +120,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-52">
-                <DropdownMenuLabel>{profile?.email}</DropdownMenuLabel>
+                <DropdownMenuLabel>@{profile?.username || profile?.email}</DropdownMenuLabel>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem onClick={toggle}>
                   {theme === "dark" ? <Sun className="mr-2 h-4 w-4" /> : <Moon className="mr-2 h-4 w-4" />}
@@ -131,9 +136,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
 
-      {/* Main */}
       <div className="flex min-w-0 flex-1 flex-col">
-        {/* Topbar */}
         <header className="flex h-16 shrink-0 items-center gap-3 border-b bg-card/60 px-4 backdrop-blur supports-[backdrop-filter]:bg-card/40">
           <div className="md:hidden"><Logo withText={false} /></div>
           <div className="relative flex-1 max-w-xl">
@@ -157,7 +160,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               <TooltipTrigger asChild>
                 <Button variant="ghost" size="icon" className="relative">
                   <Bell className="h-4 w-4" />
-                  <span className="absolute right-2 top-2 h-1.5 w-1.5 rounded-full bg-[color:var(--neon)]" />
+                  {notifCount > 0 && (
+                    <span className="absolute -right-1 -top-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-[color:var(--neon)] px-1 text-[10px] font-bold text-white">
+                      {notifCount > 9 ? "9+" : notifCount}
+                    </span>
+                  )}
                 </Button>
               </TooltipTrigger>
               <TooltipContent>Notificações</TooltipContent>

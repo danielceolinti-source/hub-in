@@ -1,46 +1,217 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Search, Filter, Star, Phone, Video, MoreVertical, Paperclip,
   Mic, Send, Smile, Tag as TagIcon, UserPlus, StickyNote, ChevronRight,
-  CheckCheck, Image as ImageIcon, FileText, Sparkles, Clock,
+  CheckCheck, Image as ImageIcon, FileText, Sparkles, Clock, Loader2, X,
 } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
+import { Textarea } from "@/components/ui/textarea";
+import { toast } from "sonner";
+import { useAuth } from "@/lib/auth";
+import { ConversationsService } from "@/lib/services/conversations";
+import { MessagesService } from "@/lib/services/messages";
+import { SectorsService } from "@/lib/services/sectors";
+import type { ConversationWithDetails, MessageWithSender } from "@/lib/types";
 
 export const Route = createFileRoute("/app/inbox")({ component: Inbox });
 
-interface Conv { id: string; name: string; phone: string; preview: string; time: string; unread: number; sector: string; sectorColor: string; status: "open" | "pending" | "resolved"; pinned?: boolean; }
-
-const seed: Conv[] = [
-  { id: "1", name: "Carlos Mendes", phone: "+55 11 98765-4321", preview: "Posso ver o Pulse hoje?", time: "agora", unread: 2, sector: "Vendas FIAT", sectorColor: "#ef4444", status: "open", pinned: true },
-  { id: "2", name: "Patrícia Souza", phone: "+55 11 91234-5678", preview: "Vou levar amanhã às 10h", time: "2m", unread: 0, sector: "Oficina FIAT", sectorColor: "#6366f1", status: "pending" },
-  { id: "3", name: "Juliana Reis", phone: "+55 11 99999-0000", preview: "Boleto não chegou", time: "5m", unread: 1, sector: "Financeiro", sectorColor: "#10b981", status: "open" },
-  { id: "4", name: "Marcos Vinícius", phone: "+55 11 98888-7777", preview: "Compass 2024 disponível?", time: "12m", unread: 0, sector: "Vendas JEEP", sectorColor: "#0a2540", status: "open" },
-  { id: "5", name: "Renata Lima", phone: "+55 11 97777-6666", preview: "Obrigada pelo atendimento!", time: "1h", unread: 0, sector: "SAC", sectorColor: "#14b8a6", status: "resolved" },
-  { id: "6", name: "Eduardo Tavares", phone: "+55 11 96666-5555", preview: "Vocês têm seminovo até 80k?", time: "1h", unread: 3, sector: "Seminovos", sectorColor: "#8b5cf6", status: "open" },
-  { id: "7", name: "Fernanda Castro", phone: "+55 11 95555-4444", preview: "Quero agendar revisão", time: "3h", unread: 0, sector: "Pós-venda FIAT", sectorColor: "#f59e0b", status: "pending" },
-];
-
 function Inbox() {
-  const [active, setActive] = useState<string>("1");
+  const { profile, company } = useAuth();
+  const [conversations, setConversations] = useState<ConversationWithDetails[]>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<MessageWithSender[]>([]);
+  const [notes, setNotes] = useState<any[]>([]);
   const [tab, setTab] = useState("all");
   const [q, setQ] = useState("");
-  const conv = useMemo(() => seed.find(c => c.id === active)!, [active]);
-  const list = useMemo(() => {
-    return seed.filter(c => {
-      if (tab === "unread" && c.unread === 0) return false;
-      if (tab === "pinned" && !c.pinned) return false;
+  const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+  const [messageText, setMessageText] = useState("");
+  const [showTransfer, setShowTransfer] = useState(false);
+  const [sectors, setSectors] = useState<any[]>([]);
+  const [agents, setAgents] = useState<any[]>([]);
+  const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set());
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const typingTimeoutRef = useRef<NodeJS.Timeout>();
+
+  const activeConv = useMemo(() => conversations.find(c => c.id === activeId), [conversations, activeId]);
+
+  // Load conversations
+  useEffect(() => {
+    if (!company?.id) return;
+    setLoading(true);
+    const load = async () => {
+      try {
+        const data = await ConversationsService.getConversations({ companyId: company.id });
+        setConversations(data);
+        if (data.length > 0 && !activeId) setActiveId(data[0].id);
+      } catch (err) {
+        console.error(err);
+        toast.error("Erro ao carregar conversas");
+      } finally {
+        setLoading(false);
+      }
+    };
+    load();
+
+    // Load sectors and agents
+    SectorsService.getAll(company.id).then(setSectors).catch(() => {});
+    fetch(`/api/users?company_id=${company.id}`).then(r => r.json()).then(setAgents).catch(() => {});
+
+    // Subscribe to realtime
+    const sub = ConversationsService.subscribeToConversations(company.id, (payload) => {
+      if (payload.eventType === "INSERT") {
+        setConversations(prev => [{ ...payload.new, sector_name: null, sector_color: null, assigned_name: null, tags: [] }, ...prev]);
+      } else if (payload.eventType === "UPDATE") {
+        setConversations(prev => prev.map(c => c.id === payload.new.id ? { ...c, ...payload.new } : c));
+      } else if (payload.eventType === "DELETE") {
+        setConversations(prev => prev.filter(c => c.id !== payload.old.id));
+      }
+    });
+
+    return () => { sub.unsubscribe(); };
+  }, [company?.id]);
+
+  // Load messages for active conversation
+  useEffect(() => {
+    if (!activeId) return;
+    ConversationsService.getConversation(activeId).then(conv => {
+      setConversations(prev => prev.map(c => c.id === activeId ? { ...c, ...conv } : c));
+    });
+    MessagesService.getMessages(activeId).then(setMessages).catch(console.error);
+    MessagesService.getNotes(activeId).then(setNotes).catch(console.error);
+
+    // Subscribe to new messages
+    const sub = MessagesService.subscribeToMessages(activeId, async (payload) => {
+      if (payload.eventType === "INSERT") {
+        const msg = payload.new;
+        // Fetch sender info
+        if (msg.sender_id) {
+          const { data: sender } = await (await fetch(`/api/profile/${msg.sender_id}`)).json();
+          setMessages(prev => [...prev, { ...msg, sender_name: sender?.full_name, sender_avatar: sender?.avatar_url }]);
+        } else {
+          setMessages(prev => [...prev, msg]);
+        }
+      }
+    });
+
+    // Subscribe to typing
+    if (profile?.id) {
+      const typingSub = MessagesService.subscribeToTyping(activeId, profile.id, (payload) => {
+        if (payload.new?.is_typing) {
+          setTypingUsers(prev => new Set(prev).add(payload.new.user_id));
+        } else {
+          setTypingUsers(prev => { const s = new Set(prev); s.delete(payload.new?.user_id); return s; });
+        }
+      });
+      return () => { sub.unsubscribe(); typingSub.unsubscribe(); };
+    }
+
+    return () => { sub.unsubscribe(); };
+  }, [activeId]);
+
+  // Scroll to bottom on new messages
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages.length]);
+
+  const filteredConversations = useMemo(() => {
+    return conversations.filter(c => {
+      if (tab === "unread" && c.unread_count === 0) return false;
+      if (tab === "pinned" && !c.is_favorite) return false;
       if (tab === "resolved" && c.status !== "resolved") return false;
-      if (q && !(`${c.name} ${c.preview}`).toLowerCase().includes(q.toLowerCase())) return false;
+      if (q && !`${c.contact_name} ${c.contact_phone} ${c.last_message_preview || ""}`.toLowerCase().includes(q.toLowerCase())) return false;
       return true;
     });
-  }, [tab, q]);
+  }, [conversations, tab, q]);
+
+  const handleSend = async () => {
+    if (!messageText.trim() || !activeId || !profile?.id) return;
+    setSending(true);
+    try {
+      await MessagesService.sendMessage({
+        conversation_id: activeId,
+        sender_id: profile.id,
+        direction: "outbound",
+        body: messageText.trim(),
+      });
+      setMessageText("");
+      // Clear typing indicator
+      MessagesService.setTypingIndicator(activeId, profile.id, false);
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    } catch (err) {
+      toast.error("Erro ao enviar mensagem");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const handleTyping = (text: string) => {
+    setMessageText(text);
+    if (!activeId || !profile?.id) return;
+    MessagesService.setTypingIndicator(activeId, profile.id, true);
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => {
+      MessagesService.setTypingIndicator(activeId, profile.id, false);
+    }, 2000);
+  };
+
+  const handleStatusChange = async (status: string) => {
+    if (!activeId) return;
+    try {
+      await ConversationsService.updateStatus(activeId, status);
+      toast.success(`Conversa ${status === "resolved" ? "finalizada" : "atualizada"}`);
+    } catch {
+      toast.error("Erro ao atualizar status");
+    }
+  };
+
+  const handleAssign = async (userId: string | null) => {
+    if (!activeId) return;
+    try {
+      await ConversationsService.assignConversation(activeId, userId);
+      toast.success("Atendente atribuído");
+      setShowTransfer(false);
+    } catch {
+      toast.error("Erro ao atribuir");
+    }
+  };
+
+  const handleNewConversation = async () => {
+    if (!company?.id) return;
+    const name = prompt("Nome do contato:");
+    if (!name) return;
+    const phone = prompt("Telefone do contato (com DDD):");
+    if (!phone) return;
+    try {
+      const conv = await ConversationsService.createConversation({
+        company_id: company.id,
+        contact_name: name,
+        contact_phone: phone,
+        assigned_to: profile?.id,
+      });
+      setActiveId(conv.id);
+      setConversations(prev => [{ ...conv, sector_name: null, sector_color: null, assigned_name: profile?.full_name, tags: [] }, ...prev]);
+      toast.success("Conversa criada");
+    } catch {
+      toast.error("Erro ao criar conversa");
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex h-full items-center justify-center">
+        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
 
   return (
     <div className="grid h-full grid-cols-[340px_1fr_320px] overflow-hidden">
@@ -50,9 +221,14 @@ function Inbox() {
           <div className="flex items-center justify-between">
             <div>
               <h2 className="text-base font-semibold">Atendimentos</h2>
-              <p className="text-xs text-muted-foreground">{list.length} conversas</p>
+              <p className="text-xs text-muted-foreground">{filteredConversations.length} conversas</p>
             </div>
-            <Button variant="outline" size="icon" className="h-8 w-8"><Filter className="h-4 w-4" /></Button>
+            <div className="flex gap-1">
+              <Button variant="outline" size="icon" className="h-8 w-8" onClick={handleNewConversation}>
+                <UserPlus className="h-4 w-4" />
+              </Button>
+              <Button variant="outline" size="icon" className="h-8 w-8"><Filter className="h-4 w-4" /></Button>
+            </div>
           </div>
           <div className="relative">
             <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -68,147 +244,214 @@ function Inbox() {
           </Tabs>
         </div>
         <div className="flex-1 overflow-y-auto">
-          {list.map((c) => {
-            const isActive = c.id === active;
-            return (
-              <button key={c.id} onClick={() => setActive(c.id)}
-                className={`relative flex w-full items-start gap-3 border-b border-border/50 px-4 py-3 text-left transition ${
-                  isActive ? "bg-accent/60" : "hover:bg-accent/40"
-                }`}>
-                {isActive && <span className="absolute left-0 top-2 h-[calc(100%-16px)] w-[3px] rounded-r bg-[color:var(--neon)]" />}
-                <div className="relative">
-                  <Avatar className="h-10 w-10"><AvatarFallback>{c.name.split(" ").map(p => p[0]).slice(0,2).join("")}</AvatarFallback></Avatar>
-                  <span className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-card" />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="truncate text-sm font-semibold">{c.name}</p>
-                    <span className="shrink-0 text-[10px] text-muted-foreground">{c.time}</span>
+          {filteredConversations.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
+              <MessageSquare className="h-8 w-8 text-muted-foreground/40 mb-2" />
+              <p className="text-sm text-muted-foreground">Nenhuma conversa encontrada</p>
+              <Button variant="link" size="sm" onClick={handleNewConversation} className="mt-2">
+                Criar nova conversa
+              </Button>
+            </div>
+          ) : (
+            filteredConversations.map((c) => {
+              const isActive = c.id === activeId;
+              return (
+                <button key={c.id} onClick={() => setActiveId(c.id)}
+                  className={`relative flex w-full items-start gap-3 border-b border-border/50 px-4 py-3 text-left transition ${
+                    isActive ? "bg-accent/60" : "hover:bg-accent/40"
+                  }`}>
+                  {isActive && <span className="absolute left-0 top-2 h-[calc(100%-16px)] w-[3px] rounded-r bg-[color:var(--neon)]" />}
+                  <div className="relative">
+                    <Avatar className="h-10 w-10"><AvatarFallback className="text-xs">{c.contact_name.split(" ").map(p => p[0]).slice(0,2).join("")}</AvatarFallback></Avatar>
+                    {c.status === "open" && <span className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-card" />}
+                    {c.status === "pending" && <span className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-amber-500 ring-2 ring-card" />}
                   </div>
-                  <p className="truncate text-xs text-muted-foreground">{c.preview}</p>
-                  <div className="mt-1.5 flex items-center gap-1.5">
-                    <span className="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
-                      style={{ background: `${c.sectorColor}1f`, color: c.sectorColor }}>
-                      <span className="h-1 w-1 rounded-full" style={{ background: c.sectorColor }} />{c.sector}
-                    </span>
-                    {c.pinned && <Star className="h-3 w-3 text-amber-500 fill-amber-500" />}
-                    {c.unread > 0 && (
-                      <Badge className="ml-auto h-4 min-w-[16px] justify-center bg-[color:var(--neon)] px-1 text-[10px] text-white">{c.unread}</Badge>
-                    )}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="truncate text-sm font-semibold">{c.contact_name}</p>
+                      <span className="shrink-0 text-[10px] text-muted-foreground">
+                        {c.last_message_at ? new Date(c.last_message_at).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }) : ""}
+                      </span>
+                    </div>
+                    <p className="truncate text-xs text-muted-foreground">{c.last_message_preview || "Nenhuma mensagem"}</p>
+                    <div className="mt-1.5 flex items-center gap-1.5">
+                      {c.sector_name && (
+                        <span className="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+                          style={{ background: `${c.sector_color || "#3b82f6"}1f`, color: c.sector_color || "#3b82f6" }}>
+                          <span className="h-1 w-1 rounded-full" style={{ background: c.sector_color || "#3b82f6" }} />{c.sector_name}
+                        </span>
+                      )}
+                      {c.is_favorite && <Star className="h-3 w-3 text-amber-500 fill-amber-500" />}
+                      {c.unread_count > 0 && (
+                        <Badge className="ml-auto h-4 min-w-[16px] justify-center bg-[color:var(--neon)] px-1 text-[10px] text-white">{c.unread_count}</Badge>
+                      )}
+                    </div>
                   </div>
-                </div>
-              </button>
-            );
-          })}
+                </button>
+              );
+            })
+          )}
         </div>
       </aside>
 
       {/* CENTER — Conversation */}
       <section className="flex min-w-0 flex-col bg-background">
-        <div className="flex h-16 shrink-0 items-center justify-between border-b bg-card/40 px-5 backdrop-blur">
-          <div className="flex items-center gap-3">
-            <Avatar className="h-10 w-10"><AvatarFallback>{conv.name.split(" ").map(p=>p[0]).slice(0,2).join("")}</AvatarFallback></Avatar>
-            <div>
-              <p className="text-sm font-semibold leading-tight">{conv.name}</p>
-              <p className="text-xs text-muted-foreground">{conv.phone} • <span className="text-emerald-500">online agora</span></p>
+        {activeConv ? (
+          <>
+            <div className="flex h-16 shrink-0 items-center justify-between border-b bg-card/40 px-5 backdrop-blur">
+              <div className="flex items-center gap-3">
+                <Avatar className="h-10 w-10"><AvatarFallback className="text-xs">{activeConv.contact_name.split(" ").map(p=>p[0]).slice(0,2).join("")}</AvatarFallback></Avatar>
+                <div>
+                  <p className="text-sm font-semibold leading-tight">{activeConv.contact_name}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {activeConv.contact_phone}
+                    {activeConv.status === "open" && <span className="text-emerald-500 ml-1">• online</span>}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-1">
+                <Button variant="ghost" size="icon" onClick={() => handleStatusChange("resolved")} title="Finalizar">
+                  <CheckCheck className="h-4 w-4" />
+                </Button>
+                <Button variant="ghost" size="icon"><Phone className="h-4 w-4" /></Button>
+                <Separator orientation="vertical" className="mx-1 h-6" />
+                <Dialog open={showTransfer} onOpenChange={setShowTransfer}>
+                  <DialogTrigger asChild>
+                    <Button variant="outline" size="sm" className="gap-1.5"><UserPlus className="h-3.5 w-3.5" /> Transferir</Button>
+                  </DialogTrigger>
+                  <DialogContent>
+                    <DialogHeader><DialogTitle>Transferir conversa</DialogTitle></DialogHeader>
+                    <div className="space-y-2">
+                      {agents.filter((a: any) => a.id !== profile?.id).map((agent: any) => (
+                        <button key={agent.id} onClick={() => handleAssign(agent.id)}
+                          className="flex w-full items-center gap-3 rounded-lg p-2 hover:bg-accent">
+                          <Avatar className="h-8 w-8"><AvatarFallback className="text-xs">{agent.full_name?.split(" ").map((p: string) => p[0]).join("")}</AvatarFallback></Avatar>
+                          <div className="text-left">
+                            <p className="text-sm font-medium">{agent.full_name}</p>
+                            <p className="text-xs text-muted-foreground">{agent.job_title || "Atendente"}</p>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </DialogContent>
+                </Dialog>
+                <Button variant="ghost" size="icon"><MoreVertical className="h-4 w-4" /></Button>
+              </div>
             </div>
-          </div>
-          <div className="flex items-center gap-1">
-            <Button variant="ghost" size="icon"><Phone className="h-4 w-4" /></Button>
-            <Button variant="ghost" size="icon"><Video className="h-4 w-4" /></Button>
-            <Separator orientation="vertical" className="mx-1 h-6" />
-            <Button variant="outline" size="sm" className="gap-1.5"><UserPlus className="h-3.5 w-3.5" /> Transferir</Button>
-            <Button variant="ghost" size="icon"><MoreVertical className="h-4 w-4" /></Button>
-          </div>
-        </div>
 
-        {/* Messages */}
-        <div className="flex-1 overflow-y-auto px-6 py-6">
-          <div className="mx-auto flex max-w-3xl flex-col gap-3">
-            <DayDivider label="Hoje" />
-            <Bubble side="in" name={conv.name} text="Olá! Vi o anúncio do Fiat Pulse Abarth no Instagram. Vocês ainda têm em estoque?" time="09:12" />
-            <Bubble side="out" text="Bom dia, Carlos! 👋 Sim, temos uma unidade na cor cinza Strato disponível. Posso te enviar fotos e a tabela de financiamento?" time="09:13" name="Você" />
-            <Bubble side="in" name={conv.name} text="Manda sim. E se possível, simula 60x com 30% de entrada." time="09:14" />
-            <InternalNote text="Cliente com bom histórico de visita ao site (4 sessões). Lead quente — priorizar." author="Marina Costa" />
-            <Bubble side="out" text="Claro! Aqui está a simulação completa, e enviei também a ficha técnica em PDF." time="09:16" name="Você" attachment={{ type: "pdf", name: "Pulse_Abarth_Financiamento.pdf", size: "284 KB" }} />
-            <Bubble side="in" name={conv.name} text="Posso ver o Pulse hoje?" time="agora" />
-            <TypingIndicator name={conv.name} />
-          </div>
-        </div>
+            <div className="flex-1 overflow-y-auto px-6 py-6">
+              <div className="mx-auto flex max-w-3xl flex-col gap-3">
+                <DayDivider label={new Date().toLocaleDateString("pt-BR", { weekday: "long", day: "numeric", month: "long" })} />
+                {messages.map((m) => (
+                  m.is_internal ? (
+                    <InternalNote key={m.id} text={m.body || ""} author={m.sender_name || "Sistema"} time={new Date(m.created_at).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })} />
+                  ) : (
+                    <Bubble key={m.id} side={m.direction === "outbound" ? "out" : "in"}
+                      text={m.body || ""}
+                      time={new Date(m.created_at).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}
+                      name={m.direction === "outbound" ? "Você" : activeConv.contact_name} />
+                  )
+                ))}
+                {Array.from(typingUsers).length > 0 && <TypingIndicator name={activeConv.contact_name} />}
+                <div ref={messagesEndRef} />
+              </div>
+            </div>
 
-        {/* Composer */}
-        <div className="shrink-0 border-t bg-card/60 px-5 py-3 backdrop-blur">
-          <div className="mx-auto flex max-w-3xl flex-col gap-2">
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Sparkles className="h-3.5 w-3.5 text-[color:var(--neon)]" />
-              <button className="rounded-md bg-accent/60 px-2 py-1 hover:bg-accent">/saudacao</button>
-              <button className="rounded-md bg-accent/60 px-2 py-1 hover:bg-accent">/horario</button>
-              <button className="rounded-md bg-accent/60 px-2 py-1 hover:bg-accent">/agendamento</button>
-              <span className="ml-auto inline-flex items-center gap-1"><Clock className="h-3 w-3" /> SLA: 1m 42s</span>
+            <div className="shrink-0 border-t bg-card/60 px-5 py-3 backdrop-blur">
+              <div className="mx-auto flex max-w-3xl flex-col gap-2">
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Sparkles className="h-3.5 w-3.5 text-[color:var(--neon)]" />
+                  <span className="ml-auto inline-flex items-center gap-1"><Clock className="h-3 w-3" /> SLA em tempo real</span>
+                </div>
+                <form onSubmit={(e) => { e.preventDefault(); handleSend(); }} className="flex items-end gap-2 rounded-xl border bg-background focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/30">
+                  <Textarea
+                    value={messageText}
+                    onChange={(e) => handleTyping(e.target.value)}
+                    placeholder="Digite uma mensagem…"
+                    className="max-h-32 min-h-[44px] flex-1 resize-none border-0 bg-transparent px-4 py-3 text-sm outline-none placeholder:text-muted-foreground shadow-none focus-visible:ring-0"
+                    onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
+                  />
+                  <div className="flex items-center gap-1 p-2">
+                    <Button type="submit" size="icon" className="h-9 w-9" disabled={sending || !messageText.trim()}>
+                      {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                    </Button>
+                  </div>
+                </form>
+              </div>
             </div>
-            <div className="flex items-end gap-2 rounded-xl border bg-background p-2 focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/30">
-              <Button variant="ghost" size="icon" className="h-9 w-9"><Paperclip className="h-4 w-4" /></Button>
-              <Button variant="ghost" size="icon" className="h-9 w-9"><ImageIcon className="h-4 w-4" /></Button>
-              <textarea
-                rows={1}
-                placeholder="Digite uma mensagem ou use / para respostas rápidas…"
-                className="max-h-32 flex-1 resize-none border-0 bg-transparent px-2 py-2 text-sm outline-none placeholder:text-muted-foreground"
-              />
-              <Button variant="ghost" size="icon" className="h-9 w-9"><Smile className="h-4 w-4" /></Button>
-              <Button variant="ghost" size="icon" className="h-9 w-9"><Mic className="h-4 w-4" /></Button>
-              <Button size="icon" className="h-9 w-9"><Send className="h-4 w-4" /></Button>
+          </>
+        ) : (
+          <div className="flex h-full items-center justify-center">
+            <div className="text-center">
+              <MessageSquare className="mx-auto h-12 w-12 text-muted-foreground/30" />
+              <p className="mt-4 text-sm text-muted-foreground">Selecione uma conversa</p>
+              <Button variant="link" size="sm" onClick={handleNewConversation}>Nova conversa</Button>
             </div>
           </div>
-        </div>
+        )}
       </section>
 
       {/* RIGHT — Contact panel */}
       <aside className="flex flex-col border-l bg-card/40 backdrop-blur">
-        <div className="border-b p-5 text-center">
-          <Avatar className="mx-auto h-16 w-16"><AvatarFallback className="text-lg">{conv.name.split(" ").map(p=>p[0]).slice(0,2).join("")}</AvatarFallback></Avatar>
-          <p className="mt-3 text-sm font-semibold">{conv.name}</p>
-          <p className="text-xs text-muted-foreground">{conv.phone}</p>
-          <div className="mt-3 flex justify-center gap-2">
-            <Button variant="outline" size="sm" className="gap-1.5"><Star className="h-3.5 w-3.5" /> Fixar</Button>
-            <Button variant="outline" size="sm" className="gap-1.5"><TagIcon className="h-3.5 w-3.5" /> Etiqueta</Button>
+        {activeConv ? (
+          <>
+            <div className="border-b p-5 text-center">
+              <Avatar className="mx-auto h-16 w-16"><AvatarFallback className="text-lg">{activeConv.contact_name.split(" ").map(p=>p[0]).slice(0,2).join("")}</AvatarFallback></Avatar>
+              <p className="mt-3 text-sm font-semibold">{activeConv.contact_name}</p>
+              <p className="text-xs text-muted-foreground">{activeConv.contact_phone}</p>
+              <div className="mt-3 flex justify-center gap-2">
+                <Button variant="outline" size="sm" className="gap-1.5" onClick={() => ConversationsService.toggleFavorite(activeId!, activeConv.is_favorite)}>
+                  <Star className={`h-3.5 w-3.5 ${activeConv.is_favorite ? "fill-amber-500 text-amber-500" : ""}`} /> {activeConv.is_favorite ? "Fixada" : "Fixar"}
+                </Button>
+              </div>
+            </div>
+            <div className="flex-1 space-y-5 overflow-y-auto p-5 text-sm">
+              <Section title="Atribuição">
+                <Row label="Setor" value={
+                  activeConv.sector_name ?
+                  <span className="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs"
+                    style={{ background: `${activeConv.sector_color || "#3b82f6"}1f`, color: activeConv.sector_color || "#3b82f6" }}>
+                    <span className="h-1.5 w-1.5 rounded-full" style={{ background: activeConv.sector_color || "#3b82f6" }} />{activeConv.sector_name}
+                  </span> : "—"
+                } />
+                <Row label="Atendente" value={activeConv.assigned_name || "Não atribuído"} />
+                <Row label="Status" value={
+                  <Badge variant="outline" className={
+                    activeConv.status === "open" ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-600" :
+                    activeConv.status === "pending" ? "border-amber-500/30 bg-amber-500/10 text-amber-600" :
+                    "border-gray-500/30 bg-gray-500/10 text-gray-600"
+                  }>
+                    {activeConv.status === "open" ? "Em andamento" : activeConv.status === "pending" ? "Pendente" : activeConv.status === "resolved" ? "Resolvido" : activeConv.status}
+                  </Badge>
+                } />
+              </Section>
+              <Section title="Ações">
+                <div className="flex flex-wrap gap-2">
+                  <Button variant="outline" size="sm" onClick={() => handleStatusChange("resolved")}>
+                    <CheckCheck className="h-3.5 w-3.5 mr-1" /> Finalizar
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => setShowTransfer(true)}>
+                    <UserPlus className="h-3.5 w-3.5 mr-1" /> Transferir
+                  </Button>
+                </div>
+              </Section>
+              <Section title="Notas internas">
+                <div className="space-y-2">
+                  {notes.slice(0, 3).map((n: any) => (
+                    <div key={n.id} className="rounded-lg border bg-amber-50/40 p-3 text-xs dark:bg-amber-500/5">
+                      <p>{n.body}</p>
+                      <p className="mt-1 text-[10px] text-muted-foreground">{n.author?.full_name || "—"} • {new Date(n.created_at).toLocaleString("pt-BR")}</p>
+                    </div>
+                  ))}
+                </div>
+              </Section>
+            </div>
+          </>
+        ) : (
+          <div className="flex h-full items-center justify-center p-6 text-center text-sm text-muted-foreground">
+            Selecione uma conversa
           </div>
-        </div>
-        <div className="flex-1 space-y-5 overflow-y-auto p-5 text-sm">
-          <Section title="Atribuição">
-            <Row label="Setor" value={<span className="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs" style={{ background:`${conv.sectorColor}1f`, color: conv.sectorColor }}><span className="h-1.5 w-1.5 rounded-full" style={{ background: conv.sectorColor }} />{conv.sector}</span>} />
-            <Row label="Atendente" value={<div className="flex items-center gap-2"><Avatar className="h-5 w-5"><AvatarFallback className="text-[10px]">MC</AvatarFallback></Avatar><span>Marina Costa</span></div>} />
-            <Row label="Status" value={<Badge variant="outline" className="border-emerald-500/30 bg-emerald-500/10 text-emerald-600">Em andamento</Badge>} />
-            <Row label="Prioridade" value={<Badge className="bg-orange-500/15 text-orange-600 hover:bg-orange-500/15">Alta</Badge>} />
-          </Section>
-          <Section title="Etiquetas">
-            <div className="flex flex-wrap gap-1.5">
-              {["Lead quente","Pulse","Financiamento"].map(t => (
-                <span key={t} className="rounded-full bg-accent px-2 py-0.5 text-xs">{t}</span>
-              ))}
-            </div>
-          </Section>
-          <Section title="Notas internas" action={<Button variant="ghost" size="sm" className="h-7 gap-1.5 text-xs"><StickyNote className="h-3 w-3" />Nova</Button>}>
-            <div className="rounded-lg border bg-amber-50/40 p-3 text-xs dark:bg-amber-500/5">
-              <p>Cliente com bom histórico. Priorizar.</p>
-              <p className="mt-1 text-[10px] text-muted-foreground">Marina Costa • há 8 min</p>
-            </div>
-          </Section>
-          <Section title="Timeline">
-            <ul className="space-y-3 text-xs">
-              {[
-                { t: "Conversa iniciada", at: "09:12", c: "oklch(0.68 0.20 250)" },
-                { t: "Transferida → Vendas FIAT", at: "09:13", c: "oklch(0.72 0.16 155)" },
-                { t: "Atribuída a Marina Costa", at: "09:14", c: "oklch(0.78 0.15 80)" },
-                { t: "PDF enviado", at: "09:16", c: "oklch(0.62 0.22 305)" },
-              ].map((e, i) => (
-                <li key={i} className="flex gap-2">
-                  <span className="mt-1 h-2 w-2 shrink-0 rounded-full" style={{ background: e.c }} />
-                  <div className="flex-1"><p>{e.t}</p><p className="text-[10px] text-muted-foreground">{e.at}</p></div>
-                </li>
-              ))}
-            </ul>
-          </Section>
-        </div>
+        )}
       </aside>
     </div>
   );
@@ -224,7 +467,7 @@ function DayDivider({ label }: { label: string }) {
   );
 }
 
-function Bubble({ side, text, time, name, attachment }: { side: "in" | "out"; text: string; time: string; name: string; attachment?: { type: string; name: string; size: string } }) {
+function Bubble({ side, text, time, name }: { side: "in" | "out"; text: string; time: string; name: string }) {
   const out = side === "out";
   return (
     <motion.div initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }}
@@ -236,12 +479,6 @@ function Bubble({ side, text, time, name, attachment }: { side: "in" | "out"; te
           : "rounded-bl-sm border bg-card text-card-foreground"
       }`}>
         <p className="whitespace-pre-wrap leading-relaxed">{text}</p>
-        {attachment && (
-          <div className={`mt-2 flex items-center gap-2 rounded-lg p-2 text-xs ${out ? "bg-white/10" : "bg-muted"}`}>
-            <FileText className="h-4 w-4" />
-            <div className="flex-1 min-w-0"><p className="truncate font-medium">{attachment.name}</p><p className="opacity-70">{attachment.size}</p></div>
-          </div>
-        )}
         <div className={`mt-1 flex items-center justify-end gap-1 text-[10px] ${out ? "text-primary-foreground/70" : "text-muted-foreground"}`}>
           {time}{out && <CheckCheck className="h-3 w-3" />}
         </div>
@@ -250,14 +487,14 @@ function Bubble({ side, text, time, name, attachment }: { side: "in" | "out"; te
   );
 }
 
-function InternalNote({ text, author }: { text: string; author: string }) {
+function InternalNote({ text, author, time }: { text: string; author: string; time: string }) {
   return (
     <div className="mx-auto flex max-w-[80%] items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs">
       <StickyNote className="h-4 w-4 shrink-0 text-amber-600" />
       <div>
         <p className="font-medium text-amber-700 dark:text-amber-400">Nota interna (invisível ao cliente)</p>
         <p className="mt-0.5">{text}</p>
-        <p className="mt-0.5 text-[10px] text-muted-foreground">— {author}</p>
+        <p className="mt-0.5 text-[10px] text-muted-foreground">— {author} • {time}</p>
       </div>
     </div>
   );
