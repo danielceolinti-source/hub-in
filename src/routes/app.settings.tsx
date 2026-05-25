@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { toast } from "sonner";
+import { createFileRoute } from "@tanstack/react-router";
 import { useAuth } from "@/lib/auth";
 import { AuthService } from "@/lib/services/auth";
 import { SectorsService } from "@/lib/services/sectors";
